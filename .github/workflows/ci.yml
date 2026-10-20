@@ -1,0 +1,142 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # =========================================================================
+  # 1. PR to main: Maven build, unit tests, Checkstyle & SonarQube analysis
+  # =========================================================================
+  build-and-sonar:
+    name: Build, Test & SonarQube Quality Gate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Maven Build and Unit Tests
+        run: mvn clean test
+
+      - name: Run Checkstyle
+        run: mvn checkstyle:checkstyle
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate Check
+        uses: sonarsource/sonarqube-quality-gate-action@v1.1.0
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+  # =========================================================================
+  # 2. Merge to main: Build & Push Docker image to Amazon ECR
+  # =========================================================================
+  docker-build-push:
+    name: Docker Build & Push to ECR
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      image_tag: ${{ steps.set-output.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'vprofileappimg' }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
+            -f Docker-files/app/multistage/Dockerfile .
+          
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+      - name: Export Image Tag Output
+        id: set-output
+        run: |
+          echo "image_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+  # =========================================================================
+  # 3. Merge to main: Update Helm values.yaml in separate Helm repository
+  # =========================================================================
+  update-helm:
+    name: Update Helm Values in GitOps Repo
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: docker-build-push
+    steps:
+      - name: Checkout Helm repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.HELM_REPO_USER }}/${{ vars.HELM_REPO_NAME || 'vprofile-helm' }}
+          token: ${{ secrets.GITOPS_PAT }}
+
+      - name: Update image and tag in values.yaml using yq
+        env:
+          ECR_REGISTRY: ${{ needs.docker-build-push.outputs.ecr_registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'vprofileappimg' }}
+          IMAGE_TAG: ${{ needs.docker-build-push.outputs.image_tag }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY"
+          echo "Updating helm/vprofile/values.yaml with image: $IMAGE_URI and tag: $IMAGE_TAG"
+          
+          yq -i ".app.image = \"$IMAGE_URI\"" helm/vprofile/values.yaml
+          yq -i ".app.tag = \"$IMAGE_TAG\"" helm/vprofile/values.yaml
+          
+          echo "Updated helm/vprofile/values.yaml content:"
+          cat helm/vprofile/values.yaml
+
+      - name: Commit and push changes to Helm repo
+        env:
+          IMAGE_TAG: ${{ needs.docker-build-push.outputs.image_tag }}
+        run: |
+          git config user.name "${{ secrets.HELM_REPO_USER }}"
+          git config user.email "${{ secrets.HELM_REPO_USER }}@users.noreply.github.com"
+          git add helm/vprofile/values.yaml
+          git diff --staged --quiet || git commit -m "Update app image and tag to $IMAGE_TAG [skip ci]"
+          git push
+
